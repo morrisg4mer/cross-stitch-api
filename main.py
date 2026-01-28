@@ -1,6 +1,6 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 import io
 import base64
 
@@ -22,6 +22,29 @@ def pixelate(img: Image.Image, colors: int = 16, grid: int = 80, scale: int = 12
     img_big = img_small.resize((grid * scale, grid * scale), Image.NEAREST)
     return img_big
 
+def draw_grid_lines(img: Image.Image, cell_size: int = 12, line_color=(0, 0, 0, 70)):
+    """
+    Desenha linhas de grade (papel quadriculado) por cima da imagem.
+    cell_size = tamanho do quadradinho em pixels
+    line_color = RGBA com transparência
+    """
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+
+    w, h = img.size
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # linhas verticais
+    for x in range(0, w + 1, cell_size):
+        draw.line([(x, 0), (x, h)], fill=line_color, width=1)
+
+    # linhas horizontais
+    for y in range(0, h + 1, cell_size):
+        draw.line([(0, y), (w, y)], fill=line_color, width=1)
+
+    return Image.alpha_composite(img, overlay)
+
 @app.get("/")
 def root():
     return {"status": "online"}
@@ -30,13 +53,20 @@ def root():
 async def convert(
     file: UploadFile = File(...),
     colors: int = 16,
-    grid: int = 80
+    grid: int = 80,
+    draw_grid: bool = False,
+    cell_size: int = 12
 ):
     contents = await file.read()
     img = Image.open(io.BytesIO(contents))
     img = ImageOps.exif_transpose(img)
 
+    # 1) gera pixel art
     result = pixelate(img, colors=colors, grid=grid)
+
+    # 2) desenha o papel grafo (quadradinhos) se pedir
+    if draw_grid:
+        result = draw_grid_lines(result, cell_size=cell_size)
 
     buf = io.BytesIO()
     result.save(buf, format="PNG")
@@ -48,5 +78,5 @@ async def convert(
         "ok": True,
         "image_base64": b64,
         "colors": colors,
-        "grid": grid
-    }
+        "g
+
