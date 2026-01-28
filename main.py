@@ -78,5 +78,7 @@ async def convert(
         "ok": True,
         "image_base64": b64,
         "colors": colors,
-        "g
-
+        "grid": grid,
+        "draw_grid": draw_grid,
+        "cell_size": cell_size
+    }
