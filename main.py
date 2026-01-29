@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps, ImageDraw
 import io
 import base64
+import math
 
 app = FastAPI()
 
@@ -15,18 +16,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def pixelate(img: Image.Image, colors: int = 16, grid: int = 80, scale: int = 12):
+def pixelate_to_grid(img: Image.Image, colors: int = 16, grid: int = 80):
+    """
+    Converte a imagem para um grid (grid x grid) com quantização de cores.
+    Retorna uma imagem pequena (grid x grid).
+    """
     img = img.convert("RGB")
     img_small = img.resize((grid, grid), Image.NEAREST)
     img_small = img_small.quantize(colors=colors).convert("RGB")
-    img_big = img_small.resize((grid * scale, grid * scale), Image.NEAREST)
-    return img_big
+    return img_small
 
-def draw_grid_lines(img: Image.Image, cell_size: int = 12, line_color=(0, 0, 0, 70)):
+def upscale_to_target(img_small: Image.Image, grid: int, target_size: int = 2400):
     """
-    Desenha linhas de grade (papel quadriculado) por cima da imagem.
-    cell_size = tamanho do quadradinho em pixels
-    line_color = RGBA com transparência
+    Amplia a imagem para alta resolução, garantindo quadradinhos nítidos.
+    target_size = tamanho final (largura/altura) em px
+    """
+    # garante que target_size seja múltiplo do grid
+    cell_size = max(1, target_size // grid)
+    final_size = grid * cell_size
+    img_big = img_small.resize((final_size, final_size), Image.NEAREST)
+    return img_big, cell_size
+
+def draw_grid_lines(
+    img: Image.Image,
+    cell_size: int,
+    highlight_every: int = 10,
+    normal_line=(0, 0, 0, 40),
+    highlight_line=(0, 0, 0, 120),
+    normal_width: int = 1,
+    highlight_width: int = 2
+):
+    """
+    Desenha linhas de grade por cima da imagem.
+    A cada `highlight_every` quadradinhos, desenha uma linha mais destacada.
     """
     if img.mode != "RGBA":
         img = img.convert("RGBA")
@@ -35,13 +57,23 @@ def draw_grid_lines(img: Image.Image, cell_size: int = 12, line_color=(0, 0, 0, 
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
+    grid = w // cell_size
+
     # linhas verticais
-    for x in range(0, w + 1, cell_size):
-        draw.line([(x, 0), (x, h)], fill=line_color, width=1)
+    for i in range(grid + 1):
+        x = i * cell_size
+        if i % highlight_every == 0:
+            draw.line([(x, 0), (x, h)], fill=highlight_line, width=highlight_width)
+        else:
+            draw.line([(x, 0), (x, h)], fill=normal_line, width=normal_width)
 
     # linhas horizontais
-    for y in range(0, h + 1, cell_size):
-        draw.line([(0, y), (w, y)], fill=line_color, width=1)
+    for i in range(grid + 1):
+        y = i * cell_size
+        if i % highlight_every == 0:
+            draw.line([(0, y), (w, y)], fill=highlight_line, width=highlight_width)
+        else:
+            draw.line([(0, y), (w, y)], fill=normal_line, width=normal_width)
 
     return Image.alpha_composite(img, overlay)
 
@@ -54,19 +86,29 @@ async def convert(
     file: UploadFile = File(...),
     colors: int = 16,
     grid: int = 80,
-    draw_grid: bool = False,
-    cell_size: int = 12
+
+    # novas opções
+    draw_grid: bool = True,
+    target_size: int = 2400,       # resolução final (quanto maior melhor)
+    highlight_every: int = 10      # linha destacada a cada 10 quadradinhos
 ):
     contents = await file.read()
     img = Image.open(io.BytesIO(contents))
     img = ImageOps.exif_transpose(img)
 
-    # 1) gera pixel art
-    result = pixelate(img, colors=colors, grid=grid)
+    # 1) cria pixel art no grid
+    img_small = pixelate_to_grid(img, colors=colors, grid=grid)
 
-    # 2) desenha o papel grafo (quadradinhos) se pedir
+    # 2) amplia para alta resolução
+    result, cell_size = upscale_to_target(img_small, grid=grid, target_size=target_size)
+
+    # 3) desenha grade por cima
     if draw_grid:
-        result = draw_grid_lines(result, cell_size=cell_size)
+        result = draw_grid_lines(
+            result,
+            cell_size=cell_size,
+            highlight_every=highlight_every
+        )
 
     buf = io.BytesIO()
     result.save(buf, format="PNG")
@@ -80,5 +122,7 @@ async def convert(
         "colors": colors,
         "grid": grid,
         "draw_grid": draw_grid,
-        "cell_size": cell_size
+        "target_size": target_size,
+        "cell_size": cell_size,
+        "highlight_every": highlight_every
     }
