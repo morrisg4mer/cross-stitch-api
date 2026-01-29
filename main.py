@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps, ImageDraw
 import io
 import base64
-import math
 
 app = FastAPI()
 
@@ -16,25 +15,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def pixelate_to_grid(img: Image.Image, colors: int = 16, grid: int = 80):
+def compute_grid_size(img: Image.Image, grid: int = 80):
     """
-    Converte a imagem para um grid (grid x grid) com quantização de cores.
-    Retorna uma imagem pequena (grid x grid).
+    Mantém proporção:
+    grid = tamanho do lado maior (ex: 80 quadradinhos no maior lado)
+    retorna (grid_w, grid_h)
     """
+    w, h = img.size
+
+    if w >= h:
+        # paisagem: fixa largura
+        grid_w = grid
+        grid_h = max(1, round(grid * (h / w)))
+    else:
+        # retrato: fixa altura
+        grid_h = grid
+        grid_w = max(1, round(grid * (w / h)))
+
+    return grid_w, grid_h
+
+def pixelate_to_grid(img: Image.Image, colors: int, grid_w: int, grid_h: int):
     img = img.convert("RGB")
-    img_small = img.resize((grid, grid), Image.NEAREST)
+    img_small = img.resize((grid_w, grid_h), Image.NEAREST)
     img_small = img_small.quantize(colors=colors).convert("RGB")
     return img_small
 
-def upscale_to_target(img_small: Image.Image, grid: int, target_size: int = 2400):
+def upscale_to_target(img_small: Image.Image, grid_w: int, grid_h: int, target_size: int = 2400):
     """
-    Amplia a imagem para alta resolução, garantindo quadradinhos nítidos.
-    target_size = tamanho final (largura/altura) em px
+    Amplia para alta resolução mantendo proporção.
+    target_size = tamanho final do lado maior (px)
     """
-    # garante que target_size seja múltiplo do grid
-    cell_size = max(1, target_size // grid)
-    final_size = grid * cell_size
-    img_big = img_small.resize((final_size, final_size), Image.NEAREST)
+    # calcula cell_size baseado no lado maior
+    bigger_side = max(grid_w, grid_h)
+    cell_size = max(1, target_size // bigger_side)
+
+    final_w = grid_w * cell_size
+    final_h = grid_h * cell_size
+
+    img_big = img_small.resize((final_w, final_h), Image.NEAREST)
     return img_big, cell_size
 
 def draw_grid_lines(
@@ -47,8 +65,8 @@ def draw_grid_lines(
     highlight_width: int = 2
 ):
     """
-    Desenha linhas de grade por cima da imagem.
-    A cada `highlight_every` quadradinhos, desenha uma linha mais destacada.
+    Desenha grade por cima.
+    Linha destacada a cada 10 quadradinhos (ou highlight_every).
     """
     if img.mode != "RGBA":
         img = img.convert("RGBA")
@@ -57,18 +75,19 @@ def draw_grid_lines(
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    grid = w // cell_size
+    grid_w = w // cell_size
+    grid_h = h // cell_size
 
-    # linhas verticais
-    for i in range(grid + 1):
+    # verticais
+    for i in range(grid_w + 1):
         x = i * cell_size
         if i % highlight_every == 0:
             draw.line([(x, 0), (x, h)], fill=highlight_line, width=highlight_width)
         else:
             draw.line([(x, 0), (x, h)], fill=normal_line, width=normal_width)
 
-    # linhas horizontais
-    for i in range(grid + 1):
+    # horizontais
+    for i in range(grid_h + 1):
         y = i * cell_size
         if i % highlight_every == 0:
             draw.line([(0, y), (w, y)], fill=highlight_line, width=highlight_width)
@@ -89,20 +108,28 @@ async def convert(
 
     # novas opções
     draw_grid: bool = True,
-    target_size: int = 2400,       # resolução final (quanto maior melhor)
-    highlight_every: int = 10      # linha destacada a cada 10 quadradinhos
+    target_size: int = 2400,
+    highlight_every: int = 10
 ):
     contents = await file.read()
     img = Image.open(io.BytesIO(contents))
     img = ImageOps.exif_transpose(img)
 
-    # 1) cria pixel art no grid
-    img_small = pixelate_to_grid(img, colors=colors, grid=grid)
+    # 1) calcula grid mantendo proporção
+    grid_w, grid_h = compute_grid_size(img, grid=grid)
 
-    # 2) amplia para alta resolução
-    result, cell_size = upscale_to_target(img_small, grid=grid, target_size=target_size)
+    # 2) pixeliza no grid proporcional
+    img_small = pixelate_to_grid(img, colors=colors, grid_w=grid_w, grid_h=grid_h)
 
-    # 3) desenha grade por cima
+    # 3) amplia em alta resolução proporcional
+    result, cell_size = upscale_to_target(
+        img_small,
+        grid_w=grid_w,
+        grid_h=grid_h,
+        target_size=target_size
+    )
+
+    # 4) desenha grade com destaque a cada 10
     if draw_grid:
         result = draw_grid_lines(
             result,
@@ -121,6 +148,8 @@ async def convert(
         "image_base64": b64,
         "colors": colors,
         "grid": grid,
+        "grid_w": grid_w,
+        "grid_h": grid_h,
         "draw_grid": draw_grid,
         "target_size": target_size,
         "cell_size": cell_size,
