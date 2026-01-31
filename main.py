@@ -1,8 +1,9 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageOps, ImageDraw, ImageEnhance, ImageFilter
+from PIL import Image, ImageOps, ImageDraw
 import io
 import base64
+import math
 
 app = FastAPI()
 
@@ -17,51 +18,75 @@ app.add_middleware(
 
 def compute_grid_size(img: Image.Image, grid: int = 80):
     """
-    Mantém proporção:
-    grid = tamanho do lado maior (ex: 80 quadradinhos no maior lado)
-    retorna (grid_w, grid_h)
+    Mantém proporção.
+    grid = quantidade de quadradinhos no maior lado.
+    Retorna (grid_w, grid_h).
     """
     w, h = img.size
-
     if w >= h:
         grid_w = grid
         grid_h = max(1, round(grid * (h / w)))
     else:
         grid_h = grid
         grid_w = max(1, round(grid * (w / h)))
-
     return grid_w, grid_h
 
 
-def preprocess_image(img: Image.Image, contrast: float = 1.10, sharpness: float = 1.20):
+def dominant_color_block(block: Image.Image):
     """
-    Pré-processamento para melhorar detalhes antes de reduzir pro grid.
+    Cor dominante de um bloco (método estilo Excel).
+    Rápido e com bom resultado.
+    """
+    # reduz o bloco para acelerar
+    block = block.convert("RGB")
+    small = block.resize((16, 16), Image.BILINEAR)
+
+    # pega cor mais frequente
+    colors = small.getcolors(16 * 16)
+    if not colors:
+        return (255, 255, 255)
+    # ordena por frequência
+    colors.sort(key=lambda x: x[0], reverse=True)
+    return colors[0][1]
+
+
+def mosaic_from_original(img: Image.Image, grid_w: int, grid_h: int):
+    """
+    Cria mosaico SEM distorcer:
+    cada quadradinho representa um bloco da imagem original.
+    Resultado: imagem pequena (grid_w x grid_h) com cor por célula.
     """
     img = img.convert("RGB")
+    w, h = img.size
 
-    # contraste leve
-    img = ImageEnhance.Contrast(img).enhance(contrast)
+    cell_w = w / grid_w
+    cell_h = h / grid_h
 
-    # nitidez leve
-    img = ImageEnhance.Sharpness(img).enhance(sharpness)
+    out = Image.new("RGB", (grid_w, grid_h), (255, 255, 255))
+    px = out.load()
 
-    return img
+    for gy in range(grid_h):
+        for gx in range(grid_w):
+            left = int(gx * cell_w)
+            right = int((gx + 1) * cell_w)
+            top = int(gy * cell_h)
+            bottom = int((gy + 1) * cell_h)
+
+            # garante pelo menos 1px
+            right = max(right, left + 1)
+            bottom = max(bottom, top + 1)
+
+            block = img.crop((left, top, right, bottom))
+            px[gx, gy] = dominant_color_block(block)
+
+    return out
 
 
-def pixelate_to_grid(img: Image.Image, colors: int, grid_w: int, grid_h: int):
+def quantize_colors(img_small: Image.Image, colors: int):
     """
-    1) reduz com LANCZOS (melhor qualidade)
-    2) quantiza cores
+    Reduz para N cores.
     """
-    img = img.convert("RGB")
-
-    # Redução de alta qualidade (importante!)
-    img_small = img.resize((grid_w, grid_h), Image.LANCZOS)
-
-    # Quantização de cores
-    img_small = img_small.quantize(colors=colors, method=2).convert("RGB")
-
-    return img_small
+    return img_small.quantize(colors=colors, method=Image.MEDIANCUT).convert("RGB")
 
 
 def upscale_to_target(img_small: Image.Image, grid_w: int, grid_h: int, target_size: int = 2400):
@@ -70,12 +95,11 @@ def upscale_to_target(img_small: Image.Image, grid_w: int, grid_h: int, target_s
     target_size = tamanho final do lado maior (px)
     """
     bigger_side = max(grid_w, grid_h)
-    cell_size = max(1, target_size // bigger_side)
+    cell_size = max(8, target_size // bigger_side)  # mínimo 8px por célula
 
     final_w = grid_w * cell_size
     final_h = grid_h * cell_size
 
-    # Ampliação com NEAREST pra manter quadradinho perfeito
     img_big = img_small.resize((final_w, final_h), Image.NEAREST)
     return img_big, cell_size
 
@@ -133,29 +157,32 @@ async def convert(
     colors: int = 16,
     grid: int = 80,
 
-    # opções
     draw_grid: bool = True,
     target_size: int = 2400,
-    highlight_every: int = 10,
-
-    # melhorias de qualidade
-    contrast: float = 1.10,
-    sharpness: float = 1.20
+    highlight_every: int = 10
 ):
     contents = await file.read()
     img = Image.open(io.BytesIO(contents))
     img = ImageOps.exif_transpose(img)
 
-    # 0) pré-processamento (melhora detalhes antes de reduzir)
-    img = preprocess_image(img, contrast=contrast, sharpness=sharpness)
+    # limita tamanho máximo pra não pesar no Render
+    MAX_SIDE = 2200
+    w, h = img.size
+    bigger = max(w, h)
+    if bigger > MAX_SIDE:
+        scale = MAX_SIDE / bigger
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # 1) calcula grid mantendo proporção
+    # 1) calcula grid proporcional
     grid_w, grid_h = compute_grid_size(img, grid=grid)
 
-    # 2) pixeliza no grid proporcional (reduz com qualidade)
-    img_small = pixelate_to_grid(img, colors=colors, grid_w=grid_w, grid_h=grid_h)
+    # 2) cria mosaico pelo ORIGINAL (excel style)
+    img_small = mosaic_from_original(img, grid_w=grid_w, grid_h=grid_h)
 
-    # 3) amplia em alta resolução proporcional
+    # 3) reduz para N cores
+    img_small = quantize_colors(img_small, colors=colors)
+
+    # 4) amplia em alta resolução
     result, cell_size = upscale_to_target(
         img_small,
         grid_w=grid_w,
@@ -163,7 +190,7 @@ async def convert(
         target_size=target_size
     )
 
-    # 4) desenha grade com destaque a cada 10
+    # 5) desenha grade
     if draw_grid:
         result = draw_grid_lines(
             result,
@@ -172,7 +199,7 @@ async def convert(
         )
 
     buf = io.BytesIO()
-    result.save(buf, format="PNG")
+    result.save(buf, format="PNG", optimize=True)
     buf.seek(0)
 
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -187,7 +214,5 @@ async def convert(
         "draw_grid": draw_grid,
         "target_size": target_size,
         "cell_size": cell_size,
-        "highlight_every": highlight_every,
-        "contrast": contrast,
-        "sharpness": sharpness
+        "highlight_every": highlight_every
     }
