@@ -1,6 +1,6 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageEnhance, ImageFilter
 import io
 import base64
 
@@ -24,36 +24,61 @@ def compute_grid_size(img: Image.Image, grid: int = 80):
     w, h = img.size
 
     if w >= h:
-        # paisagem: fixa largura
         grid_w = grid
         grid_h = max(1, round(grid * (h / w)))
     else:
-        # retrato: fixa altura
         grid_h = grid
         grid_w = max(1, round(grid * (w / h)))
 
     return grid_w, grid_h
 
-def pixelate_to_grid(img: Image.Image, colors: int, grid_w: int, grid_h: int):
+
+def preprocess_image(img: Image.Image, contrast: float = 1.10, sharpness: float = 1.20):
+    """
+    Pré-processamento para melhorar detalhes antes de reduzir pro grid.
+    """
     img = img.convert("RGB")
-    img_small = img.resize((grid_w, grid_h), Image.NEAREST)
-    img_small = img_small.quantize(colors=colors).convert("RGB")
+
+    # contraste leve
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+
+    # nitidez leve
+    img = ImageEnhance.Sharpness(img).enhance(sharpness)
+
+    return img
+
+
+def pixelate_to_grid(img: Image.Image, colors: int, grid_w: int, grid_h: int):
+    """
+    1) reduz com LANCZOS (melhor qualidade)
+    2) quantiza cores
+    """
+    img = img.convert("RGB")
+
+    # Redução de alta qualidade (importante!)
+    img_small = img.resize((grid_w, grid_h), Image.LANCZOS)
+
+    # Quantização de cores
+    img_small = img_small.quantize(colors=colors, method=2).convert("RGB")
+
     return img_small
+
 
 def upscale_to_target(img_small: Image.Image, grid_w: int, grid_h: int, target_size: int = 2400):
     """
     Amplia para alta resolução mantendo proporção.
     target_size = tamanho final do lado maior (px)
     """
-    # calcula cell_size baseado no lado maior
     bigger_side = max(grid_w, grid_h)
     cell_size = max(1, target_size // bigger_side)
 
     final_w = grid_w * cell_size
     final_h = grid_h * cell_size
 
+    # Ampliação com NEAREST pra manter quadradinho perfeito
     img_big = img_small.resize((final_w, final_h), Image.NEAREST)
     return img_big, cell_size
+
 
 def draw_grid_lines(
     img: Image.Image,
@@ -66,7 +91,7 @@ def draw_grid_lines(
 ):
     """
     Desenha grade por cima.
-    Linha destacada a cada 10 quadradinhos (ou highlight_every).
+    Linha destacada a cada 10 quadradinhos.
     """
     if img.mode != "RGBA":
         img = img.convert("RGBA")
@@ -96,9 +121,11 @@ def draw_grid_lines(
 
     return Image.alpha_composite(img, overlay)
 
+
 @app.get("/")
 def root():
     return {"status": "online"}
+
 
 @app.post("/convert")
 async def convert(
@@ -106,19 +133,26 @@ async def convert(
     colors: int = 16,
     grid: int = 80,
 
-    # novas opções
+    # opções
     draw_grid: bool = True,
     target_size: int = 2400,
-    highlight_every: int = 10
+    highlight_every: int = 10,
+
+    # melhorias de qualidade
+    contrast: float = 1.10,
+    sharpness: float = 1.20
 ):
     contents = await file.read()
     img = Image.open(io.BytesIO(contents))
     img = ImageOps.exif_transpose(img)
 
+    # 0) pré-processamento (melhora detalhes antes de reduzir)
+    img = preprocess_image(img, contrast=contrast, sharpness=sharpness)
+
     # 1) calcula grid mantendo proporção
     grid_w, grid_h = compute_grid_size(img, grid=grid)
 
-    # 2) pixeliza no grid proporcional
+    # 2) pixeliza no grid proporcional (reduz com qualidade)
     img_small = pixelate_to_grid(img, colors=colors, grid_w=grid_w, grid_h=grid_h)
 
     # 3) amplia em alta resolução proporcional
@@ -153,5 +187,7 @@ async def convert(
         "draw_grid": draw_grid,
         "target_size": target_size,
         "cell_size": cell_size,
-        "highlight_every": highlight_every
+        "highlight_every": highlight_every,
+        "contrast": contrast,
+        "sharpness": sharpness
     }
