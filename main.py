@@ -1,13 +1,11 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageEnhance, ImageFilter
 import io
 import base64
-import math
 
 app = FastAPI()
 
-# Permite Lovable chamar sua API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,11 +15,6 @@ app.add_middleware(
 )
 
 def compute_grid_size(img: Image.Image, grid: int = 80):
-    """
-    Mantém proporção.
-    grid = quantidade de quadradinhos no maior lado.
-    Retorna (grid_w, grid_h).
-    """
     w, h = img.size
     if w >= h:
         grid_w = grid
@@ -31,92 +24,49 @@ def compute_grid_size(img: Image.Image, grid: int = 80):
         grid_w = max(1, round(grid * (w / h)))
     return grid_w, grid_h
 
-
-def dominant_color_block(block: Image.Image):
+def preprocess(img: Image.Image, mode: str):
     """
-    Cor dominante de um bloco (método estilo Excel).
-    Rápido e com bom resultado.
-    """
-    # reduz o bloco para acelerar
-    block = block.convert("RGB")
-    small = block.resize((16, 16), Image.BILINEAR)
-
-    # pega cor mais frequente
-    colors = small.getcolors(16 * 16)
-    if not colors:
-        return (255, 255, 255)
-    # ordena por frequência
-    colors.sort(key=lambda x: x[0], reverse=True)
-    return colors[0][1]
-
-
-def mosaic_from_original(img: Image.Image, grid_w: int, grid_h: int):
-    """
-    Cria mosaico SEM distorcer:
-    cada quadradinho representa um bloco da imagem original.
-    Resultado: imagem pequena (grid_w x grid_h) com cor por célula.
+    photo: leve melhoria
+    logo: melhora agressiva para bordas e definição
     """
     img = img.convert("RGB")
-    w, h = img.size
 
-    cell_w = w / grid_w
-    cell_h = h / grid_h
+    if mode == "logo":
+        # aumenta contraste e nitidez pra logo ficar limpa
+        img = ImageEnhance.Contrast(img).enhance(1.6)
+        img = ImageEnhance.Sharpness(img).enhance(2.2)
+        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=2))
+    else:
+        # foto: leve melhoria só pra ficar mais nítida
+        img = ImageEnhance.Contrast(img).enhance(1.15)
+        img = ImageEnhance.Sharpness(img).enhance(1.2)
 
-    out = Image.new("RGB", (grid_w, grid_h), (255, 255, 255))
-    px = out.load()
+    return img
 
-    for gy in range(grid_h):
-        for gx in range(grid_w):
-            left = int(gx * cell_w)
-            right = int((gx + 1) * cell_w)
-            top = int(gy * cell_h)
-            bottom = int((gy + 1) * cell_h)
-
-            # garante pelo menos 1px
-            right = max(right, left + 1)
-            bottom = max(bottom, top + 1)
-
-            block = img.crop((left, top, right, bottom))
-            px[gx, gy] = dominant_color_block(block)
-
-    return out
-
-
-def quantize_colors(img_small: Image.Image, colors: int):
-    """
-    Reduz para N cores.
-    """
-    return img_small.quantize(colors=colors, method=Image.MEDIANCUT).convert("RGB")
-
+def pixelate_to_grid(img: Image.Image, colors: int, grid_w: int, grid_h: int):
+    img_small = img.resize((grid_w, grid_h), Image.Resampling.NEAREST)
+    img_small = img_small.quantize(colors=colors, method=2).convert("RGB")
+    return img_small
 
 def upscale_to_target(img_small: Image.Image, grid_w: int, grid_h: int, target_size: int = 2400):
-    """
-    Amplia para alta resolução mantendo proporção.
-    target_size = tamanho final do lado maior (px)
-    """
     bigger_side = max(grid_w, grid_h)
-    cell_size = max(8, target_size // bigger_side)  # mínimo 8px por célula
+    cell_size = max(1, target_size // bigger_side)
 
     final_w = grid_w * cell_size
     final_h = grid_h * cell_size
 
-    img_big = img_small.resize((final_w, final_h), Image.NEAREST)
+    img_big = img_small.resize((final_w, final_h), Image.Resampling.NEAREST)
     return img_big, cell_size
-
 
 def draw_grid_lines(
     img: Image.Image,
     cell_size: int,
     highlight_every: int = 10,
-    normal_line=(0, 0, 0, 40),
+    normal_line=(0, 0, 0, 35),
     highlight_line=(0, 0, 0, 120),
     normal_width: int = 1,
     highlight_width: int = 2
 ):
-    """
-    Desenha grade por cima.
-    Linha destacada a cada 10 quadradinhos.
-    """
     if img.mode != "RGBA":
         img = img.convert("RGBA")
 
@@ -127,7 +77,6 @@ def draw_grid_lines(
     grid_w = w // cell_size
     grid_h = h // cell_size
 
-    # verticais
     for i in range(grid_w + 1):
         x = i * cell_size
         if i % highlight_every == 0:
@@ -135,7 +84,6 @@ def draw_grid_lines(
         else:
             draw.line([(x, 0), (x, h)], fill=normal_line, width=normal_width)
 
-    # horizontais
     for i in range(grid_h + 1):
         y = i * cell_size
         if i % highlight_every == 0:
@@ -145,18 +93,16 @@ def draw_grid_lines(
 
     return Image.alpha_composite(img, overlay)
 
-
 @app.get("/")
 def root():
     return {"status": "online"}
 
-
 @app.post("/convert")
 async def convert(
     file: UploadFile = File(...),
-    colors: int = 16,
+    colors: int = 24,
     grid: int = 80,
-
+    mode: str = "photo",  # "photo" ou "logo"
     draw_grid: bool = True,
     target_size: int = 2400,
     highlight_every: int = 10
@@ -165,24 +111,16 @@ async def convert(
     img = Image.open(io.BytesIO(contents))
     img = ImageOps.exif_transpose(img)
 
-    # limita tamanho máximo pra não pesar no Render
-    MAX_SIDE = 2200
-    w, h = img.size
-    bigger = max(w, h)
-    if bigger > MAX_SIDE:
-        scale = MAX_SIDE / bigger
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    # 0) preprocess
+    img = preprocess(img, mode=mode)
 
-    # 1) calcula grid proporcional
+    # 1) grid proporcional
     grid_w, grid_h = compute_grid_size(img, grid=grid)
 
-    # 2) cria mosaico pelo ORIGINAL (excel style)
-    img_small = mosaic_from_original(img, grid_w=grid_w, grid_h=grid_h)
+    # 2) pixeliza
+    img_small = pixelate_to_grid(img, colors=colors, grid_w=grid_w, grid_h=grid_h)
 
-    # 3) reduz para N cores
-    img_small = quantize_colors(img_small, colors=colors)
-
-    # 4) amplia em alta resolução
+    # 3) upscale HD
     result, cell_size = upscale_to_target(
         img_small,
         grid_w=grid_w,
@@ -190,7 +128,7 @@ async def convert(
         target_size=target_size
     )
 
-    # 5) desenha grade
+    # 4) grade
     if draw_grid:
         result = draw_grid_lines(
             result,
@@ -199,7 +137,7 @@ async def convert(
         )
 
     buf = io.BytesIO()
-    result.save(buf, format="PNG", optimize=True)
+    result.save(buf, format="PNG")
     buf.seek(0)
 
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -211,6 +149,7 @@ async def convert(
         "grid": grid,
         "grid_w": grid_w,
         "grid_h": grid_h,
+        "mode": mode,
         "draw_grid": draw_grid,
         "target_size": target_size,
         "cell_size": cell_size,
